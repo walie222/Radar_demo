@@ -1,0 +1,16 @@
+# Netlify 配置
+[build]
+  publish = "."
+  command = ""
+
+# SPA 路由 — 所有路径返回 index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# 缓存静态资源
+[[headers]]
+  for = "/*.{css,js}"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000"
