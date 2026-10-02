@@ -575,11 +575,18 @@ function onRndStart(m) {
     resetSlots();
     enablePopBtn();
     startBotTimer();
+
+    // If I'm a bot shooter, arm my shoot timer for this round
+    var mp = myP();
+    if (mp && mp.role === 'shooter' && mp.id.indexOf('bot_') === 0) {
+        startBotShootTimer();
+    }
 }
 
-// ---- Bot Moler Auto-Pop ----
+// ---- Bot Moler Auto-Pop & Bot Shooter ----
 var botTimerId = null;
 var popCountdownId = null;
+var botShootTimerId = null;
 
 function startPopCountdown(remainingMs) {
     if (popCountdownId) clearInterval(popCountdownId);
@@ -603,15 +610,35 @@ function startPopCountdown(remainingMs) {
 
 function startBotTimer() {
     if (botTimerId) clearTimeout(botTimerId);
-    // Each round, a random bot pops after a short delay (1-3s)
-    var delay = 1000 + Math.random() * 2000;
+    // Schedule multiple competing bot pops per round for excitement
+    scheduleNextBotPop();
+    // If there's a bot shooter, arm its timer too
+    if (hasBotShooter()) startBotShootTimer();
+}
+
+function hasBotShooter() {
+    for (var k in G.players) {
+        if (G.players[k].role === 'shooter' && G.players[k].id.indexOf('bot_') === 0) return true;
+    }
+    return false;
+}
+
+// Schedule the next bot pop with random delay
+function scheduleNextBotPop() {
+    if (botTimerId) clearTimeout(botTimerId);
+    var delay = 800 + Math.random() * 2200; // 0.8-3s
     botTimerId = setTimeout(function() {
-        if (G.active && !G.popped) botPop();
+        if (G.active && !G.popped) triggerBotPop();
+        // Schedule another pop after this one resolves (if game still active)
+        setTimeout(function() {
+            if (G.active && G.phase === 'playing') scheduleNextBotPop();
+        }, POP_DURATION + 1000);
     }, delay);
 }
 
-function botPop() {
-    // Find all bot molers
+// Trigger a bot pop — publishes over PubNub so ALL clients see it
+function triggerBotPop() {
+    // Find all bot molers that haven't popped this round
     var bots = [];
     for (var k in G.players) {
         if (G.players[k].role === 'moler' && G.players[k].id.indexOf('bot_') === 0) {
@@ -620,28 +647,57 @@ function botPop() {
     }
     if (bots.length === 0) return;
 
-    // Pick a random bot
+    // Pick a random bot mole to pop
     var bot = bots[Math.floor(Math.random() * bots.length)];
+
+    // Set local state
     G.popped = true;
     G.molerId = bot.id;
     G.molerSlot = bot.slot;
     G.popDeadline = Date.now() + POP_DURATION;
 
-    // Show visual pop-up on shooter view
-    var se = $('#slot-' + bot.slot);
-    if (se) se.classList.add('pop-up');
-    var st = $('#slot-' + bot.slot + '-status');
-    if (st) st.textContent = bot.name + ' 冒头了！';
+    // Publish pop event so ALL clients (including shooter) receive it
+    pub({
+        type: 'pop',
+        pid: bot.id,
+        sid: bot.id,
+        slot: bot.slot,
+        name: bot.name,
+        rnd: G.round,
+        deadline: G.popDeadline
+    });
 
-    startPopCountdown(POP_DURATION);
-
-    // Auto-reset after POP_DURATION — clear visual + end round if no shot
+    // Auto-end round if not shot within POP_DURATION
     setTimeout(function() {
-        if (G.active && G.popped && !G.shot) {
-            resetSlots();
-            endRound('timeout');
-        }
+        if (G.active && G.popped && !G.shot) endRound('timeout');
     }, POP_DURATION);
+}
+
+// Bot shooter: waits for a pop then fires after a short delay
+function startBotShootTimer() {
+    if (botShootTimerId) clearTimeout(botShootTimerId);
+    // React quickly once a pop appears (200-600ms reaction time)
+    botShootTimerId = setTimeout(function() {
+        if (G.active && G.popped && !G.shot) {
+            botShoot();
+        }
+    }, 200 + Math.random() * 400);
+}
+
+function botShoot() {
+    var p = myP();
+    // Only bot shooters should auto-fire
+    if (p && p.role === 'shooter' && p.id.indexOf('bot_') === 0) {
+        doShoot(G.molerSlot);
+        return;
+    }
+    // If current player is human shooter but a bot is also shooter,
+    // pick a random slot (70% chance to pick correctly for fun)
+    if (p && p.role === 'shooter') {
+        // Bot shooter competes — pick correct slot 60% of the time
+        var target = (Math.random() < 0.6) ? G.molerSlot : (1 + Math.floor(Math.random() * 3));
+        doShoot(target);
+    }
 }
 
 function enablePopBtn() {
@@ -682,14 +738,21 @@ function onPop(m) {
     var p = myP();
     if (!p) return;
 
+    // Ignore duplicate pops for the same round
+    if (G.popped && G.shot) return;
+
     G.popped = true;
     G.molerId = m.sid;
     G.molerSlot = m.slot;
-    // Use server-sent deadline, or compute locally (1s from now)
-    G.popDeadline = m.deadline || (Date.now() + POP_DURATION);
+    // Always use a fresh POP_DURATION from now to avoid flicker from network delay
+    // The original deadline may have already passed by the time this message arrives
+    G.popDeadline = Date.now() + POP_DURATION;
 
     if (p.role === 'moler') {
         setMolerState('waiting', m.name + ' 冒头了，等待结果...');
+        // Disable pop button while another moler is up
+        var btn = $('#btn-pop-up');
+        if (btn) btn.disabled = true;
         return;
     }
 
@@ -699,18 +762,19 @@ function onPop(m) {
     var st = $('#slot-' + m.slot + '-status');
     if (st) st.textContent = m.name + ' 冒头了！';
 
-    // Show countdown for shooter
-    startPopCountdown(G.popDeadline - Date.now());
+    // Show countdown for shooter — full POP_DURATION window
+    startPopCountdown(POP_DURATION);
 
-    // Enforce deadline: after POP_DURATION, clear visual + end round if not shot
-    var remaining = Math.max(G.popDeadline - Date.now(), 100);
+    // Auto-end round if not shot within POP_DURATION
     setTimeout(function() {
         if (G.popped && !G.shot && G.molerId === m.sid) {
-            // Visual expired — clear it and end round
             resetSlots();
             if (G.active) endRound('timeout');
         }
-    }, remaining);
+    }, POP_DURATION);
+
+    // If there's a bot shooter competing, arm its timer
+    if (hasBotShooter()) startBotShootTimer();
 }
 
 // ---- SHOOT ----
@@ -719,8 +783,6 @@ function doShoot(slotNum) {
     if (!p || p.role !== 'shooter') return;
     if (!G.popped || !G.active) return;
     if (G.shot) return;
-    // Reject if pop deadline has passed — mole is no longer visible
-    if (G.popDeadline && Date.now() > G.popDeadline) return;
 
     G.shot = true;
     var hit = (slotNum === G.molerSlot);
@@ -731,7 +793,7 @@ function doShoot(slotNum) {
         if (G.players[G.molerId]) G.players[G.molerId].score -= 5;
     }
 
-    // UI
+    // UI feedback — always show result regardless of hit/miss
     var se = $('#slot-' + slotNum);
     var res = $('#shooter-result');
     if (hit) {
@@ -771,12 +833,28 @@ function onFire(m) {
         }
     }
 
+    // Also show shooter UI feedback when receiving fire from another client (e.g. bot shooter)
+    if (p && p.role === 'shooter' && m.pid !== G.id) {
+        var se = $('#slot-' + m.slot);
+        var res = $('#shooter-result');
+        if (m.hit) {
+            if (se) se.classList.add('hit-flash');
+            if (res) res.innerHTML = '<span class="result-hit">💥 击中！+10分</span>';
+        } else {
+            if (se) se.classList.add('miss-flash');
+            if (res) res.innerHTML = '<span class="result-miss">😅 打空了！</span>';
+        }
+        $$('.slot').forEach(function(s) { s.classList.add('disabled'); });
+    }
+
     updateScores();
 }
 
 // ---- Round End ----
+var _roundEnding = false;
 function endRound(result) {
-    if (!G.active) return;
+    if (!G.active || _roundEnding) return;
+    _roundEnding = true;
     G.active = false;
 
     var scores = {};
@@ -784,6 +862,9 @@ function endRound(result) {
 
     pub({ type: 'rndend', pid: G.id, result: result, rnd: G.round, scores: scores });
     procRndEnd(result, scores);
+
+    // Reset guard after cooldown so concurrent calls don't re-trigger
+    setTimeout(function() { _roundEnding = false; }, CONFIG.GAME.roundCooldown * 1000);
 }
 
 function onRndEnd(m) {
@@ -799,7 +880,12 @@ function procRndEnd(result, scores) {
     resetSlots();
     updateScores();
 
+    // Clear any pending bot timers
+    if (botTimerId) { clearTimeout(botTimerId); botTimerId = null; }
+    if (botShootTimerId) { clearTimeout(botShootTimerId); botShootTimerId = null; }
+
     setTimeout(function() {
+        _roundEnding = false;
         if (G.phase === 'playing') nextRound();
     }, CONFIG.GAME.roundCooldown * 1000);
 }
@@ -862,6 +948,11 @@ function startTimer() {
 // ---- Game Over ----
 function gameOver() {
     G.phase = 'ended';
+    // Clean up all timers
+    if (G.timerId) clearInterval(G.timerId);
+    if (botTimerId) clearTimeout(botTimerId);
+    if (botShootTimerId) clearTimeout(botShootTimerId);
+    if (popCountdownId) clearInterval(popCountdownId);
     var arr = [];
     for (var k in G.players) arr.push(G.players[k]);
     arr.sort(function(a,b) { return b.score - a.score; });
