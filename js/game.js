@@ -744,9 +744,9 @@ function onPop(m) {
     G.popped = true;
     G.molerId = m.sid;
     G.molerSlot = m.slot;
-    // Always use a fresh POP_DURATION from now to avoid flicker from network delay
-    // The original deadline may have already passed by the time this message arrives
-    G.popDeadline = Date.now() + POP_DURATION;
+    // Use sender's deadline as reference, but ensure at minimum POP_DURATION from now
+    // to account for network delay. The actual expiration is driven by rndend message.
+    G.popDeadline = Math.max(m.deadline || 0, Date.now() + POP_DURATION);
 
     if (p.role === 'moler') {
         setMolerState('waiting', m.name + ' 冒头了，等待结果...');
@@ -762,16 +762,18 @@ function onPop(m) {
     var st = $('#slot-' + m.slot + '-status');
     if (st) st.textContent = m.name + ' 冒头了！';
 
-    // Show countdown for shooter — full POP_DURATION window
+    // Show countdown for shooter — use full POP_DURATION so shooter always gets a fair window
     startPopCountdown(POP_DURATION);
 
-    // Auto-end round if not shot within POP_DURATION
+    // Safety fallback: if rndend never arrives (network issue), force-clear after 2x POP_DURATION
+    // This only resets local state/visuals — does NOT call endRound to avoid double-publishing rndend
     setTimeout(function() {
-        if (G.popped && !G.shot && G.molerId === m.sid) {
+        if (G.popped && G.molerId === m.sid && !G.shot) {
             resetSlots();
-            if (G.active) endRound('timeout');
+            var res = $('#shooter-result');
+            if (res) res.innerHTML = '<span class="result-miss">⏰ 超时未响应</span>';
         }
-    }, POP_DURATION);
+    }, POP_DURATION * 2);
 
     // If there's a bot shooter competing, arm its timer
     if (hasBotShooter()) startBotShootTimer();
@@ -783,6 +785,8 @@ function doShoot(slotNum) {
     if (!p || p.role !== 'shooter') return;
     if (!G.popped || !G.active) return;
     if (G.shot) return;
+    // Reject if the pop has visually expired (deadline passed)
+    if (G.popDeadline && Date.now() > G.popDeadline) return;
 
     G.shot = true;
     var hit = (slotNum === G.molerSlot);
@@ -898,6 +902,11 @@ function resetSlots() {
     $$('.slot-status').forEach(function(s) { s.textContent = '空'; });
     var r = $('#shooter-result');
     if (r) r.innerHTML = '';
+    // CRITICAL: clear pop state along with visuals so stale clicks are rejected
+    G.popped = false;
+    G.molerId = '';
+    G.molerSlot = 0;
+    G.popDeadline = 0;
 }
 
 // ---- Molere State ----
