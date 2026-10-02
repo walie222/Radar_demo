@@ -563,6 +563,7 @@ function nextRound() {
 }
 
 function onRndStart(m) {
+    console.log('[DEBUG onRndStart] rnd=' + m.rnd + ' from=' + m.pid);
     G.round = m.rnd;
     G.active = true;
     G.popped = false;
@@ -711,6 +712,7 @@ function enablePopBtn() {
 
 // ---- POP UP (1-second auto-duration) ----
 var POP_DURATION = 1000; // ms — how long a mole stays up
+var shooterPopTimeoutId = null; // shooter's own local timeout for pop expiry
 
 function doPop() {
     var p = myP();
@@ -730,6 +732,7 @@ function doPop() {
 
     // Pop lasts exactly POP_DURATION ms — then auto-end round if not shot
     setTimeout(function() {
+        console.log('[DEBUG doPop timeout] active=' + G.active + ' popped=' + G.popped + ' shot=' + G.shot);
         if (G.active && G.popped && !G.shot) endRound('timeout');
     }, POP_DURATION);
 }
@@ -738,8 +741,14 @@ function onPop(m) {
     var p = myP();
     if (!p) return;
 
+    console.log('[DEBUG onPop] role=' + p.role + ' popped=' + G.popped + ' shot=' + G.shot +
+        ' m.sid=' + m.sid + ' m.deadline=' + m.deadline + ' now=' + Date.now());
+
     // Ignore duplicate pops for the same round
-    if (G.popped && G.shot) return;
+    if (G.popped && G.shot) {
+        console.log('[DEBUG onPop] REJECTED: already popped+shot');
+        return;
+    }
 
     G.popped = true;
     G.molerId = m.sid;
@@ -747,6 +756,7 @@ function onPop(m) {
     // Use sender's deadline as reference, but ensure at minimum POP_DURATION from now
     // to account for network delay. The actual expiration is driven by rndend message.
     G.popDeadline = Math.max(m.deadline || 0, Date.now() + POP_DURATION);
+    console.log('[DEBUG onPop] set popDeadline=' + G.popDeadline + ' (' + ((G.popDeadline - Date.now())/1000).toFixed(2) + 's from now)');
 
     if (p.role === 'moler') {
         setMolerState('waiting', m.name + ' 冒头了，等待结果...');
@@ -757,23 +767,30 @@ function onPop(m) {
     }
 
     // Shooter — show pop-up visually
+    console.log('[DEBUG onPop] SHOOTER: showing slot ' + m.slot + ' for ' + m.name);
     var se = $('#slot-' + m.slot);
     if (se) se.classList.add('pop-up');
     var st = $('#slot-' + m.slot + '-status');
     if (st) st.textContent = m.name + ' 冒头了！';
 
-    // Show countdown for shooter — use full POP_DURATION so shooter always gets a fair window
+    // Show countdown for shooter — full POP_DURATION from receipt time
     startPopCountdown(POP_DURATION);
 
-    // Safety fallback: if rndend never arrives (network issue), force-clear after 2x POP_DURATION
-    // This only resets local state/visuals — does NOT call endRound to avoid double-publishing rndend
-    setTimeout(function() {
+    // CRITICAL: The shooter manages its OWN pop timeout locally.
+    // Do NOT rely on rndend from the sender — network latency and clock skew
+    // make the sender's timeout arrive at an unpredictable time on the receiver.
+    // Clear any previous local timeout first.
+    if (shooterPopTimeoutId) clearTimeout(shooterPopTimeoutId);
+    shooterPopTimeoutId = setTimeout(function() {
+        // Only clear if this is still the active pop (not shot, same moler)
         if (G.popped && G.molerId === m.sid && !G.shot) {
             resetSlots();
             var res = $('#shooter-result');
-            if (res) res.innerHTML = '<span class="result-miss">⏰ 超时未响应</span>';
+            if (res) res.innerHTML = '<span class="result-miss">⏰ 时间到！</span>';
+            // Mark round as ended locally so procRndEnd from sender is a no-op for visuals
+            G.popped = false;
         }
-    }, POP_DURATION * 2);
+    }, POP_DURATION);
 
     // If there's a bot shooter competing, arm its timer
     if (hasBotShooter()) startBotShootTimer();
@@ -857,6 +874,7 @@ function onFire(m) {
 // ---- Round End ----
 var _roundEnding = false;
 function endRound(result) {
+    console.log('[DEBUG endRound] result=' + result + ' active=' + G.active + ' roundEnding=' + _roundEnding);
     if (!G.active || _roundEnding) return;
     _roundEnding = true;
     G.active = false;
@@ -872,15 +890,26 @@ function endRound(result) {
 }
 
 function onRndEnd(m) {
+    console.log('[DEBUG onRndEnd] result=' + m.result + ' rnd=' + m.rnd + ' currentRnd=' + G.round + ' from pid=' + m.pid);
+    // Ignore stale rndend from a previous round
+    if (m.rnd && m.rnd < G.round) {
+        console.log('[DEBUG onRndEnd] IGNORING stale rndend (old round)');
+        return;
+    }
     procRndEnd(m.result, m.scores);
 }
 
 function procRndEnd(result, scores) {
+    console.log('[DEBUG procRndEnd] result=' + result + ' active=' + G.active + ' popped=' + G.popped);
     if (scores) {
         for (var k in scores) {
             if (G.players[k]) G.players[k].score = scores[k];
         }
     }
+
+    // Clear shooter's local pop timeout since round is ending
+    if (shooterPopTimeoutId) { clearTimeout(shooterPopTimeoutId); shooterPopTimeoutId = null; }
+
     resetSlots();
     updateScores();
 
@@ -895,7 +924,9 @@ function procRndEnd(result, scores) {
 }
 
 function resetSlots() {
+    console.log('[DEBUG resetSlots] clearing all slots, popped was=' + G.popped);
     if (popCountdownId) { clearInterval(popCountdownId); popCountdownId = null; }
+    if (shooterPopTimeoutId) { clearTimeout(shooterPopTimeoutId); shooterPopTimeoutId = null; }
     $$('.slot').forEach(function(s) {
         s.classList.remove('pop-up','hit-flash','miss-flash','disabled');
     });
